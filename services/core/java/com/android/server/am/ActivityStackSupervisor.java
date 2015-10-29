@@ -161,9 +161,11 @@ public final class ActivityStackSupervisor implements DisplayListener {
     static final int RESUME_TOP_ACTIVITY_MSG = FIRST_SUPERVISOR_STACK_MSG + 2;
     static final int SLEEP_TIMEOUT_MSG = FIRST_SUPERVISOR_STACK_MSG + 3;
     static final int LAUNCH_TIMEOUT_MSG = FIRST_SUPERVISOR_STACK_MSG + 4;
-    public BoostFramework mPerf = null;
     public BoostFramework mPerf_iop = null;
+    public BoostFramework mPerfBoost = null;
+    public BoostFramework mPerfPack = null;
     public boolean mIsPerfBoostEnabled = false;
+    public boolean mIsperfDisablepackingEnable = false;
     public int lBoostTimeOut = 0;
     public int lDisPackTimeOut = 0;
     public int lBoostCpuParamVal[];
@@ -352,13 +354,19 @@ public final class ActivityStackSupervisor implements DisplayListener {
         /* Is perf lock for cpu-boost enabled during App 1st launch */
         mIsPerfBoostEnabled = mService.mContext.getResources().getBoolean(
                    com.android.internal.R.bool.config_enableCpuBoostForAppLaunch);
+        mIsperfDisablepackingEnable = mService.mContext.getResources().getBoolean(
+                   com.android.internal.R.bool.config_disablePacking);
+
         if(mIsPerfBoostEnabled) {
            lBoostTimeOut = mService.mContext.getResources().getInteger(
                    com.android.internal.R.integer.launchboost_timeout_param);
+           lBoostCpuParamVal = mService.mContext.getResources().getIntArray(
+                           com.android.internal.R.array.launchboost_param_value);
+        }
+
+        if(mIsperfDisablepackingEnable) {
            lDisPackTimeOut = mService.mContext.getResources().getInteger(
                    com.android.internal.R.integer.disablepacking_timeout_param);
-           lBoostCpuParamVal = mService.mContext.getResources().getIntArray(
-                   com.android.internal.R.array.launchboost_param_value);
            lBoostPackParamVal = mService.mContext.getResources().getIntArray(
                         com.android.internal.R.array.launchboost_packing_param_value);
        }
@@ -1501,6 +1509,11 @@ public final class ActivityStackSupervisor implements DisplayListener {
         if (err == ActivityManager.START_SUCCESS && intent.getComponent() == null) {
             // We couldn't find a class that can handle the given Intent.
             // That's the end of that!
+            final Uri data = intent.getData();
+            final String strData = data != null ? data.toSafeString() : null;
+            EventLog.writeEvent(EventLogTags.AM_INTENT_NOT_RESOLVED, callingPackage,
+                    intent.getAction(), intent.getType(), strData, intent.getFlags());
+
             err = ActivityManager.START_INTENT_NOT_RESOLVED;
         }
 
@@ -3063,12 +3076,18 @@ public final class ActivityStackSupervisor implements DisplayListener {
 
     void acquireAppLaunchPerfLock() {
        /* Acquire perf lock during new app launch */
-       if (mIsPerfBoostEnabled == true && mPerf == null) {
-           mPerf = new BoostFramework();
+       if (mIsperfDisablepackingEnable == true && mPerfPack == null) {
+           mPerfPack = new BoostFramework();
        }
-       if (mPerf != null) {
-             mPerf.perfLockAcquire(lDisPackTimeOut, lBoostPackParamVal);
-             mPerf.perfLockAcquire(lBoostTimeOut, lBoostCpuParamVal);
+       if (mPerfPack != null) {
+           mPerfPack.perfLockAcquire(lDisPackTimeOut, lBoostPackParamVal);
+       }
+
+       if (mIsPerfBoostEnabled == true && mPerfBoost == null) {
+           mPerfBoost = new BoostFramework();
+       }
+       if (mPerfBoost != null) {
+           mPerfBoost.perfLockAcquire(lBoostTimeOut, lBoostCpuParamVal);
        }
     }
 

@@ -91,6 +91,7 @@ public class StatusBarKeyguardViewManager {
         mContainer = container;
         mStatusBarWindowManager = statusBarWindowManager;
         mScrimController = scrimController;
+        if (mBouncer != null) mBouncer.removeView();
         mBouncer = new KeyguardBouncer(mContext, mViewMediatorCallback, mLockPatternUtils,
                 mStatusBarWindowManager, container);
     }
@@ -494,5 +495,9 @@ public class StatusBarKeyguardViewManager {
         if (mPhoneStatusBar.getNavigationBarView() != null) {
             mPhoneStatusBar.getNavigationBarView().setWakeAndUnlocking(true);
         }
+    }
+
+    public boolean isKeyguardShowingMedia() {
+        return mPhoneStatusBar.isKeyguardShowingMedia();
     }
 }

@@ -298,6 +298,7 @@ public class WindowManagerService extends IWindowManager.Stub
     private static final String SYSTEM_SECURE = "ro.secure";
     private static final String SYSTEM_DEBUGGABLE = "ro.debuggable";
 
+    private static final String PERSIST_SYS_LCD_DENSITY = "persist.sys.lcd_density";
     private static final String DENSITY_OVERRIDE = "ro.config.density_override";
     private static final String SIZE_OVERRIDE = "ro.config.size_override";
 
@@ -2143,6 +2144,36 @@ public class WindowManagerService extends IWindowManager.Stub
                         + wallpaper + " anim layer: " + wallpaper.mWinAnimator.mAnimLayer);
             }
         }
+    }
+
+    public int getLastWallpaperX() {
+        int curTokenIndex = mWallpaperTokens.size();
+        while (curTokenIndex > 0) {
+            curTokenIndex--;
+            WindowToken token = mWallpaperTokens.get(curTokenIndex);
+            int curWallpaperIndex = token.windows.size();
+            while (curWallpaperIndex > 0) {
+                curWallpaperIndex--;
+                WindowState wallpaperWin = token.windows.get(curWallpaperIndex);
+                return wallpaperWin.mXOffset;
+            }
+        }
+        return -1;
+    }
+
+    public int getLastWallpaperY() {
+        int curTokenIndex = mWallpaperTokens.size();
+        while (curTokenIndex > 0) {
+            curTokenIndex--;
+            WindowToken token = mWallpaperTokens.get(curTokenIndex);
+            int curWallpaperIndex = token.windows.size();
+            while (curWallpaperIndex > 0) {
+                curWallpaperIndex--;
+                WindowState wallpaperWin = token.windows.get(curWallpaperIndex);
+                return wallpaperWin.mYOffset;
+            }
+        }
+        return -1;
     }
 
     boolean updateWallpaperOffsetLocked(WindowState wallpaperWin, int dw, int dh,
@@ -5466,7 +5497,7 @@ public class WindowManagerService extends IWindowManager.Stub
 
     @Override
     public void keyguardGoingAway(boolean disableWindowAnimations,
-            boolean keyguardGoingToNotificationShade) {
+            boolean keyguardGoingToNotificationShade, boolean keyguardShowingMedia) {
         if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DISABLE_KEYGUARD)
                 != PackageManager.PERMISSION_GRANTED) {
             throw new SecurityException("Requires DISABLE_KEYGUARD permission");
@@ -5477,6 +5508,7 @@ public class WindowManagerService extends IWindowManager.Stub
             mAnimator.mKeyguardGoingAway = true;
             mAnimator.mKeyguardGoingAwayToNotificationShade = keyguardGoingToNotificationShade;
             mAnimator.mKeyguardGoingAwayDisableWindowAnimations = disableWindowAnimations;
+            mAnimator.mKeyguardGoingAwayShowingMedia = keyguardShowingMedia;
             requestTraversalLocked();
         }
     }
@@ -5777,7 +5809,7 @@ public class WindowManagerService extends IWindowManager.Stub
         boolean wallpaperEnabled = mContext.getResources().getBoolean(
                 com.android.internal.R.bool.config_enableWallpaperService)
                 && !mOnlyCore;
-        boolean haveKeyguard = true;
+        boolean haveKeyguard = false;
         // TODO(multidisplay): Expand to all displays?
         final WindowList windows = getDefaultWindowListLocked();
         final int N = windows.size();
@@ -8558,6 +8590,9 @@ public class WindowManagerService extends IWindowManager.Stub
 
     @Override
     public int getInitialDisplayDensity(int displayId) {
+        if (displayId == Display.DEFAULT_DISPLAY) {
+            return DisplayMetrics.DENSITY_DEVICE_DEFAULT;
+        }
         synchronized (mWindowMap) {
             final DisplayContent displayContent = getDisplayContentLocked(displayId);
             if (displayContent != null && displayContent.hasAccess(Binder.getCallingUid())) {
@@ -8571,6 +8606,9 @@ public class WindowManagerService extends IWindowManager.Stub
 
     @Override
     public int getBaseDisplayDensity(int displayId) {
+        if (displayId == Display.DEFAULT_DISPLAY) {
+            return DisplayMetrics.DENSITY_PREFERRED;
+        }
         synchronized (mWindowMap) {
             final DisplayContent displayContent = getDisplayContentLocked(displayId);
             if (displayContent != null && displayContent.hasAccess(Binder.getCallingUid())) {
@@ -8598,6 +8636,7 @@ public class WindowManagerService extends IWindowManager.Stub
             synchronized(mWindowMap) {
                 final DisplayContent displayContent = getDisplayContentLocked(displayId);
                 if (displayContent != null) {
+                    SystemProperties.set(PERSIST_SYS_LCD_DENSITY, Integer.toString(density));
                     setForcedDisplayDensityLocked(displayContent, density);
                     Settings.Global.putString(mContext.getContentResolver(),
                             Settings.Global.DISPLAY_DENSITY_FORCED, Integer.toString(density));
@@ -8605,6 +8644,10 @@ public class WindowManagerService extends IWindowManager.Stub
             }
         } finally {
             Binder.restoreCallingIdentity(ident);
+        }
+        try {
+            ActivityManagerNative.getDefault().restart();
+        } catch (RemoteException e) {
         }
     }
 
@@ -8634,6 +8677,7 @@ public class WindowManagerService extends IWindowManager.Stub
             synchronized(mWindowMap) {
                 final DisplayContent displayContent = getDisplayContentLocked(displayId);
                 if (displayContent != null) {
+                    SystemProperties.set(PERSIST_SYS_LCD_DENSITY, null);
                     setForcedDisplayDensityLocked(displayContent,
                             displayContent.mInitialDisplayDensity);
                     Settings.Global.putString(mContext.getContentResolver(),
@@ -8642,6 +8686,10 @@ public class WindowManagerService extends IWindowManager.Stub
             }
         } finally {
             Binder.restoreCallingIdentity(ident);
+        }
+        try {
+            ActivityManagerNative.getDefault().restart();
+        } catch (RemoteException e) {
         }
     }
 
@@ -11094,6 +11142,16 @@ public class WindowManagerService extends IWindowManager.Stub
     @Override
     public boolean hasNavigationBar() {
         return mPolicy.hasNavigationBar();
+    }
+
+    @Override
+    public boolean hasPermanentMenuKey() {
+        return mPolicy.hasPermanentMenuKey();
+    }
+
+    @Override 
+    public boolean needsNavigationBar() {
+        return mPolicy.needsNavigationBar();
     }
 
     @Override

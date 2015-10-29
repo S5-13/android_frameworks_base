@@ -1,6 +1,8 @@
 /*
  * Copyright (C) 2006-2008 The Android Open Source Project
- *
+ * This code has been modified.  Portions copyright (C) 2010, T-Mobile USA, Inc.
+ * Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -52,6 +54,7 @@ import android.app.usage.UsageStatsManagerInternal;
 import android.appwidget.AppWidgetManager;
 import android.content.pm.PermissionInfo;
 import android.content.res.Resources;
+import android.content.res.ThemeConfig;
 import android.graphics.Bitmap;
 import android.graphics.Point;
 import android.graphics.Rect;
@@ -73,6 +76,7 @@ import android.util.SparseIntArray;
 import android.view.Display;
 import android.util.BoostFramework;
 
+import android.view.InflateException;
 import com.android.internal.R;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.app.AssistUtils;
@@ -171,6 +175,7 @@ import android.content.pm.InstrumentationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ParceledListSlice;
+import android.content.pm.ThemeUtils;
 import android.content.pm.UserInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.PathPermission;
@@ -179,6 +184,7 @@ import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.res.CompatibilityInfo;
 import android.content.res.Configuration;
+import android.content.res.ThemeConfig;
 import android.net.Proxy;
 import android.net.ProxyInfo;
 import android.net.Uri;
@@ -192,6 +198,7 @@ import android.os.FactoryTest;
 import android.os.FileObserver;
 import android.os.FileUtils;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.IPermissionController;
 import android.os.IProcessInfoService;
@@ -260,6 +267,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.Date;
+import java.text.SimpleDateFormat;
 
 public final class ActivityManagerService extends ActivityManagerNative
         implements Watchdog.Monitor, BatteryStatsImpl.BatteryCallback {
@@ -387,6 +396,8 @@ public final class ActivityManagerService extends ActivityManagerNative
     // How many bytes to write into the dropbox log before truncating
     static final int DROPBOX_MAX_SIZE = 256 * 1024;
 
+    static final String PROP_REFRESH_THEME = "sys.refresh_theme";
+
     // Access modes for handleIncomingUser.
     static final int ALLOW_NON_FULL = 0;
     static final int ALLOW_NON_FULL_IN_PROFILE = 1;
@@ -480,6 +491,8 @@ public final class ActivityManagerService extends ActivityManagerNative
      * The package name of the DeviceOwner. This package is not permitted to have its data cleared.
      */
     String mDeviceOwnerName;
+
+    SimpleDateFormat mTraceDateFormat = new SimpleDateFormat("dd_MMM_HH_mm_ss.SSS");
 
     public class PendingAssistExtras extends Binder implements Runnable {
         public final ActivityRecord activity;
@@ -1008,6 +1021,7 @@ public final class ActivityManagerService extends ActivityManagerNative
     boolean mLaunchWarningShown = false;
 
     Context mContext;
+    Context mUiContext;
 
     int mFactoryTest;
 
@@ -1233,12 +1247,6 @@ public final class ActivityManagerService extends ActivityManagerNative
     final ArrayList<UidRecord.ChangeItem> mAvailUidChanges = new ArrayList<>();
 
     /**
-     * Runtime CPU use collection thread.  This object's lock is used to
-     * perform synchronization with the thread (notifying it to run).
-     */
-    final Thread mProcessCpuThread;
-
-    /**
      * Used to collect per-process CPU use for ANRs, battery stats, etc.
      * Must acquire this object's lock when accessing it.
      * NOTE: this lock will be held while doing long operations (trawling
@@ -1394,6 +1402,7 @@ public final class ActivityManagerService extends ActivityManagerNative
     final ServiceThread mHandlerThread;
     final MainHandler mHandler;
     final UiHandler mUiHandler;
+    final CpuTrackerHandler mCpuTrackerHandler;
 
     final class UiHandler extends Handler {
         public UiHandler() {
@@ -1431,7 +1440,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                         return;
                     }
                     if (mShowDialogs && !mSleeping && !mShuttingDown) {
-                        Dialog d = new AppErrorDialog(mContext,
+                        Dialog d = new AppErrorDialog(getUiContext(),
                                 ActivityManagerService.this, res, proc);
                         d.show();
                         proc.crashDialog = d;
@@ -1466,7 +1475,7 @@ public final class ActivityManagerService extends ActivityManagerNative
 
                     if (mShowDialogs) {
                         Dialog d = new AppNotRespondingDialog(ActivityManagerService.this,
-                                mContext, proc, (ActivityRecord)data.get("activity"),
+                                getUiContext(), proc, (ActivityRecord)data.get("activity"),
                                 msg.arg1 != 0);
                         d.show();
                         proc.anrDialog = d;
@@ -1492,7 +1501,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                     }
                     AppErrorResult res = (AppErrorResult) data.get("result");
                     if (mShowDialogs && !mSleeping && !mShuttingDown) {
-                        Dialog d = new StrictModeViolationDialog(mContext,
+                        Dialog d = new StrictModeViolationDialog(getUiContext(),
                                 ActivityManagerService.this, res, proc);
                         d.show();
                         proc.crashDialog = d;
@@ -1506,7 +1515,7 @@ public final class ActivityManagerService extends ActivityManagerNative
             } break;
             case SHOW_FACTORY_ERROR_MSG: {
                 Dialog d = new FactoryErrorDialog(
-                    mContext, msg.getData().getCharSequence("msg"));
+                    getUiContext(), msg.getData().getCharSequence("msg"));
                 d.show();
                 ensureBootCompleted();
             } break;
@@ -1517,7 +1526,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                         if (!app.waitedForDebugger) {
                             Dialog d = new AppWaitingForDebuggerDialog(
                                     ActivityManagerService.this,
-                                    mContext, app);
+                                    getUiContext(), app);
                             app.waitDialog = d;
                             app.waitedForDebugger = true;
                             d.show();
@@ -2048,6 +2057,47 @@ public final class ActivityManagerService extends ActivityManagerNative
         }
     };
 
+    static final int SCHEDULE_CPU_STATS_MSG = 1;
+    static final int UPDATE_CPU_STATS_MSG = 2;
+
+    final class CpuTrackerHandler extends Handler {
+        public CpuTrackerHandler(Looper looper) {
+            super(looper);
+        }
+
+        @Override
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+            case SCHEDULE_CPU_STATS_MSG: {
+                final long now = SystemClock.uptimeMillis();
+                long nextCpuDelay = (mLastCpuTime.get() + MONITOR_CPU_MAX_TIME) - now;
+                long nextWriteDelay = (mLastWriteTime + BATTERY_STATS_TIME) - now;
+                //Slog.i(TAG, "Cpu delay=" + nextCpuDelay + ", write delay=" + nextWriteDelay);
+                if (nextWriteDelay < nextCpuDelay) {
+                    nextCpuDelay = nextWriteDelay;
+                }
+                if (nextCpuDelay > 0) {
+                    mProcessCpuMutexFree.set(true);
+                    sendEmptyMessageDelayed(UPDATE_CPU_STATS_MSG, nextCpuDelay);
+                }
+            } break;
+            case UPDATE_CPU_STATS_MSG: {
+                updateCpuStatsNow();
+                schedule();
+            } break;
+            }
+        }
+
+        void schedule() {
+            sendEmptyMessage(SCHEDULE_CPU_STATS_MSG);
+        }
+
+        void updateNow() {
+            removeMessages(UPDATE_CPU_STATS_MSG);
+            sendEmptyMessage(UPDATE_CPU_STATS_MSG);
+        }
+    }
+
     static final int COLLECT_PSS_BG_MSG = 1;
 
     final Handler mBgHandler = new Handler(BackgroundThread.getHandler().getLooper()) {
@@ -2311,6 +2361,9 @@ public final class ActivityManagerService extends ActivityManagerNative
         mHandlerThread.start();
         mHandler = new MainHandler(mHandlerThread.getLooper());
         mUiHandler = new UiHandler();
+        HandlerThread cpuTrackerThread = new HandlerThread("CpuTracker");
+        cpuTrackerThread.start();
+        mCpuTrackerHandler = new CpuTrackerHandler(cpuTrackerThread.getLooper());
 
         mFgBroadcastQueue = new BroadcastQueue(this, mHandler,
                 "foreground", BROADCAST_FG_TIMEOUT, false);
@@ -2326,7 +2379,7 @@ public final class ActivityManagerService extends ActivityManagerNative
         File dataDir = Environment.getDataDirectory();
         File systemDir = new File(dataDir, "system");
         systemDir.mkdirs();
-        mBatteryStatsService = new BatteryStatsService(systemDir, mHandler);
+        mBatteryStatsService = new BatteryStatsService(systemDir, mCpuTrackerHandler);
         mBatteryStatsService.getActiveStatistics().readLocked();
         mBatteryStatsService.scheduleWriteToDisk();
         mOnBattery = DEBUG_POWER ? true
@@ -2361,36 +2414,6 @@ public final class ActivityManagerService extends ActivityManagerNative
         mStackSupervisor = new ActivityStackSupervisor(this, mRecentTasks);
         mTaskPersister = new TaskPersister(systemDir, mStackSupervisor, mRecentTasks);
 
-        mProcessCpuThread = new Thread("CpuTracker") {
-            @Override
-            public void run() {
-                while (true) {
-                    try {
-                        try {
-                            synchronized(this) {
-                                final long now = SystemClock.uptimeMillis();
-                                long nextCpuDelay = (mLastCpuTime.get()+MONITOR_CPU_MAX_TIME)-now;
-                                long nextWriteDelay = (mLastWriteTime+BATTERY_STATS_TIME)-now;
-                                //Slog.i(TAG, "Cpu delay=" + nextCpuDelay
-                                //        + ", write delay=" + nextWriteDelay);
-                                if (nextWriteDelay < nextCpuDelay) {
-                                    nextCpuDelay = nextWriteDelay;
-                                }
-                                if (nextCpuDelay > 0) {
-                                    mProcessCpuMutexFree.set(true);
-                                    this.wait(nextCpuDelay);
-                                }
-                            }
-                        } catch (InterruptedException e) {
-                        }
-                        updateCpuStatsNow();
-                    } catch (Exception e) {
-                        Slog.e(TAG, "Unexpected exception collecting process stats", e);
-                    }
-                }
-            }
-        };
-
         Watchdog.getInstance().addMonitor(this);
         Watchdog.getInstance().addThread(mHandler);
     }
@@ -2405,7 +2428,7 @@ public final class ActivityManagerService extends ActivityManagerNative
 
     private void start() {
         Process.removeAllProcessGroups();
-        mProcessCpuThread.start();
+        mCpuTrackerHandler.schedule();
 
         mBatteryStatsService.publish(mContext);
         mAppOpsService.publish(mContext);
@@ -2470,9 +2493,7 @@ public final class ActivityManagerService extends ActivityManagerNative
             return;
         }
         if (mProcessCpuMutexFree.compareAndSet(true, false)) {
-            synchronized (mProcessCpuThread) {
-                mProcessCpuThread.notify();
-            }
+            mCpuTrackerHandler.updateNow();
         }
     }
 
@@ -2590,6 +2611,15 @@ public final class ActivityManagerService extends ActivityManagerNative
         broadcastIntentLocked(null, null, intent, null, null, 0, null, null, null,
                 AppOpsManager.OP_NONE, null, false, false,
                 -1, Process.SYSTEM_UID, UserHandle.USER_ALL);
+    }
+
+    private Context getUiContext() {
+        synchronized (this) {
+            if (mUiContext == null && mBooted) {
+                mUiContext = ThemeUtils.createUiContext(mContext);
+            }
+            return mUiContext != null ? mUiContext : mContext;
+        }
     }
 
     /**
@@ -3316,6 +3346,13 @@ public final class ActivityManagerService extends ActivityManagerNative
                 debugFlags |= Zygote.DEBUG_ENABLE_ASSERT;
             }
 
+            //Check if zygote should refresh its fonts
+            boolean refreshTheme = false;
+            if (SystemProperties.getBoolean(PROP_REFRESH_THEME, false)) {
+                SystemProperties.set(PROP_REFRESH_THEME, "false");
+                refreshTheme = true;
+            }
+
             String requiredAbi = (abiOverride != null) ? abiOverride : app.info.primaryCpuAbi;
             if (requiredAbi == null) {
                 requiredAbi = Build.SUPPORTED_ABIS[0];
@@ -3340,7 +3377,7 @@ public final class ActivityManagerService extends ActivityManagerNative
             Process.ProcessStartResult startResult = Process.start(entryPoint,
                     app.processName, uid, uid, gids, debugFlags, mountExternal,
                     app.info.targetSdkVersion, app.info.seinfo, requiredAbi, instructionSet,
-                    app.info.dataDir, entryPointArgs);
+                    app.info.dataDir, refreshTheme, entryPointArgs);
             checkTime(startTime, "startProcess: returned from zygote!");
             Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
 
@@ -3862,7 +3899,8 @@ public final class ActivityManagerService extends ActivityManagerNative
             if (sourceRecord == null) {
                 throw new SecurityException("Called with bad activity token: " + resultTo);
             }
-            if (!sourceRecord.info.packageName.equals("android")) {
+            if (!sourceRecord.info.packageName.equals("android") &&
+                    !sourceRecord.info.packageName.equals("org.cyanogenmod.resolver")) {
                 throw new SecurityException(
                         "Must be called from an activity that is declared in the android package");
             }
@@ -5071,6 +5109,24 @@ public final class ActivityManagerService extends ActivityManagerNative
                     annotation != null ? "ANR " + annotation : "ANR",
                     info.toString());
 
+            //Set the trace file name to app name + current date format to avoid overrinding trace file
+            String tracesPath = SystemProperties.get("dalvik.vm.stack-trace-file", null);
+            if (tracesPath != null && tracesPath.length() != 0) {
+                File traceRenameFile = new File(tracesPath);
+                String newTracesPath;
+                int lpos = tracesPath.lastIndexOf (".");
+                if (-1 != lpos)
+                    newTracesPath = tracesPath.substring (0, lpos) + "_" + app.processName + "_" + mTraceDateFormat.format(new Date()) + tracesPath.substring (lpos);
+                else
+                    newTracesPath = tracesPath + "_" + app.processName;
+
+                traceRenameFile.renameTo(new File(newTracesPath));
+                Process.sendSignal(app.pid, 6);
+                SystemClock.sleep(1000);
+                Process.sendSignal(app.pid, 6);
+                SystemClock.sleep(1000);
+            }
+
             // Bring up the infamous App Not Responding dialog
             Message msg = Message.obtain();
             HashMap<String, Object> map = new HashMap<String, Object>();
@@ -5093,7 +5149,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                 @Override
                 public void run() {
                     synchronized (ActivityManagerService.this) {
-                        final Dialog d = new LaunchWarningWindow(mContext, cur, next);
+                        final Dialog d = new LaunchWarningWindow(getUiContext(), cur, next);
                         d.show();
                         mUiHandler.postDelayed(new Runnable() {
                             @Override
@@ -6293,14 +6349,16 @@ public final class ActivityManagerService extends ActivityManagerNative
 
     @Override
     public void keyguardGoingAway(boolean disableWindowAnimations,
-            boolean keyguardGoingToNotificationShade) {
+            boolean keyguardGoingToNotificationShade,
+            boolean keyguardShowingMedia) {
         enforceNotIsolatedCaller("keyguardGoingAway");
         final long token = Binder.clearCallingIdentity();
         try {
             synchronized (this) {
                 if (DEBUG_LOCKSCREEN) logLockScreen("");
                 mWindowManager.keyguardGoingAway(disableWindowAnimations,
-                        keyguardGoingToNotificationShade);
+                        keyguardGoingToNotificationShade,
+                        keyguardShowingMedia);
                 if (mLockScreenShown == LOCK_SCREEN_SHOWN) {
                     mLockScreenShown = LOCK_SCREEN_HIDDEN;
                     updateSleepIfNeededLocked();
@@ -6365,6 +6423,13 @@ public final class ActivityManagerService extends ActivityManagerNative
                 }
             }
         }, dumpheapFilter);
+
+        ThemeUtils.registerThemeChangeReceiver(mContext, new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                mUiContext = null;
+            }
+        });
 
         // Let system services know.
         mSystemServiceManager.startBootPhase(SystemService.PHASE_BOOT_COMPLETED);
@@ -10222,7 +10287,13 @@ public final class ActivityManagerService extends ActivityManagerNative
 
         if ((info.flags & PERSISTENT_MASK) == PERSISTENT_MASK) {
             app.persistent = true;
-            app.maxAdj = ProcessList.PERSISTENT_PROC_ADJ;
+
+            // The Adj score defines an order of processes to be killed.
+            // If a process is shared by multiple apps, maxAdj must be set by the highest
+            // prioritized app to avoid being killed.
+            if (app.maxAdj >= ProcessList.PERSISTENT_PROC_ADJ) {
+                app.maxAdj = ProcessList.PERSISTENT_PROC_ADJ;
+            }
         }
         if (app.thread == null && mPersistentStartingProcesses.indexOf(app) < 0) {
             mPersistentStartingProcesses.add(app);
@@ -10660,6 +10731,7 @@ public final class ActivityManagerService extends ActivityManagerNative
 
     public void requestBugReport() {
         enforceCallingPermission(android.Manifest.permission.DUMP, "requestBugReport");
+        mContext.sendBroadcast(new Intent("android.intent.action.BUGREPORT_STARTED"));
         SystemProperties.set("ctl.start", "bugreport");
     }
 
@@ -10737,9 +10809,15 @@ public final class ActivityManagerService extends ActivityManagerNative
                     return true;
                 }
             }
+            final int anrPid = proc.pid;
             mHandler.post(new Runnable() {
                 @Override
                 public void run() {
+                    if (anrPid != proc.pid) {
+                        Slog.i(TAG, "Ignoring stale ANR (occurred in " + anrPid +
+                                    ", but current pid is " + proc.pid + ")");
+                        return;
+                    }
                     appNotResponding(proc, activity, parent, aboveSystem, annotation);
                 }
             });
@@ -11962,6 +12040,28 @@ public final class ActivityManagerService extends ActivityManagerNative
         }
     }
 
+    private void sendAppFailureBroadcast(String pkgName) {
+        Intent intent = new Intent(Intent.ACTION_APP_FAILURE,
+                (pkgName != null)? Uri.fromParts("package", pkgName, null) : null);
+        mContext.sendBroadcastAsUser(intent, UserHandle.CURRENT_OR_SELF);
+    }
+
+    /**
+     * A possible theme crash is one that throws one of the following exceptions
+     * {@link android.content.res.Resources.NotFoundException}
+     * {@link android.view.InflateException}
+     *
+     * @param exceptionClassName
+     * @return True if exceptionClassName is one of the above exceptions
+     */
+    private boolean isPossibleThemeCrash(String exceptionClassName) {
+        if (Resources.NotFoundException.class.getName().equals(exceptionClassName) ||
+                InflateException.class.getName().equals(exceptionClassName)) {
+            return true;
+        }
+        return false;
+    }
+
     private boolean handleAppCrashLocked(ProcessRecord app, String reason,
             String shortMsg, String longMsg, String stackTrace) {
         long now = SystemClock.uptimeMillis();
@@ -11972,6 +12072,9 @@ public final class ActivityManagerService extends ActivityManagerNative
         } else {
             crashTime = null;
         }
+
+        if (isPossibleThemeCrash(shortMsg)) sendAppFailureBroadcast(app.info.packageName);
+
         if (crashTime != null && now < crashTime+ProcessList.MIN_CRASH_INTERVAL) {
             // This process loses!
             Slog.w(TAG, "Process " + app.info.processName
@@ -12769,6 +12872,9 @@ public final class ActivityManagerService extends ActivityManagerNative
                 ProcessRecord app = mLruProcesses.get(i);
                 if ((!allUsers && app.userId != userId)
                         || (!allUids && app.uid != callingUid)) {
+                    continue;
+                }
+                if (app.processName.equals("system")) {
                     continue;
                 }
                 if ((app.thread != null) && (!app.crashing && !app.notResponding)) {
@@ -17268,6 +17374,9 @@ public final class ActivityManagerService extends ActivityManagerNative
         synchronized(this) {
             ci = new Configuration(mConfiguration);
             ci.userSetLocale = false;
+            if (ci.themeConfig == null) {
+                ci.themeConfig = ThemeConfig.getBootTheme(mContext.getContentResolver());
+            }
         }
         return ci;
     }
@@ -17357,6 +17466,11 @@ public final class ActivityManagerService extends ActivityManagerNative
                             values.locale));
                 }
 
+                if (values.themeConfig != null) {
+                    saveThemeResourceLocked(values.themeConfig,
+                            !values.themeConfig.equals(mConfiguration.themeConfig));
+                }
+
                 mConfigurationSeq++;
                 if (mConfigurationSeq <= 0) {
                     mConfigurationSeq = 1;
@@ -17412,6 +17526,10 @@ public final class ActivityManagerService extends ActivityManagerNative
                         null, AppOpsManager.OP_NONE, null, false, false,
                         MY_PID, Process.SYSTEM_UID, UserHandle.USER_ALL);
                 if ((changes&ActivityInfo.CONFIG_LOCALE) != 0) {
+                    // if locale changed, time format may have changed
+                    final int is24Hour = android.text.format.DateFormat.is24HourFormat(mContext) ? 1 : 0;
+                    mHandler.sendMessage(mHandler.obtainMessage(UPDATE_TIME, is24Hour, 0));
+                    // now send general broadcast
                     intent = new Intent(Intent.ACTION_LOCALE_CHANGED);
                     intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
                     if (!mProcessesReady) {
@@ -17507,6 +17625,14 @@ public final class ActivityManagerService extends ActivityManagerNative
             return null;
         }
         return srec.launchedFromPackage;
+    }
+
+    private void saveThemeResourceLocked(ThemeConfig t, boolean isDiff){
+        if(isDiff) {
+            Settings.Secure.putStringForUser(mContext.getContentResolver(),
+                    Configuration.THEME_PKG_CONFIGURATION_PERSISTENCE_PROPERTY, t.toJson(),
+                    UserHandle.USER_CURRENT);
+        }
     }
 
     // =========================================================
