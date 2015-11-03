@@ -74,7 +74,6 @@ import android.util.ArraySet;
 import android.util.DebugUtils;
 import android.util.SparseIntArray;
 import android.view.Display;
-import android.util.BoostFramework;
 
 import android.view.InflateException;
 import com.android.internal.R;
@@ -198,7 +197,6 @@ import android.os.FactoryTest;
 import android.os.FileObserver;
 import android.os.FileUtils;
 import android.os.Handler;
-import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.IPermissionController;
 import android.os.IProcessInfoService;
@@ -1247,6 +1245,12 @@ public final class ActivityManagerService extends ActivityManagerNative
     final ArrayList<UidRecord.ChangeItem> mAvailUidChanges = new ArrayList<>();
 
     /**
+     * Runtime CPU use collection thread.  This object's lock is used to
+     * perform synchronization with the thread (notifying it to run).
+     */
+    final Thread mProcessCpuThread;
+
+    /**
      * Used to collect per-process CPU use for ANRs, battery stats, etc.
      * Must acquire this object's lock when accessing it.
      * NOTE: this lock will be held while doing long operations (trawling
@@ -1367,6 +1371,8 @@ public final class ActivityManagerService extends ActivityManagerNative
     static final int REPORT_TIME_TRACKER_MSG = 55;
     static final int REPORT_USER_SWITCH_COMPLETE_MSG = 56;
     static final int SHUTDOWN_UI_AUTOMATION_CONNECTION_MSG = 57;
+    static final int POST_PRIVACY_NOTIFICATION_MSG = 58;
+    static final int CANCEL_PRIVACY_NOTIFICATION_MSG = 59;
 
     static final int FIRST_ACTIVITY_STACK_MSG = 100;
     static final int FIRST_BROADCAST_QUEUE_MSG = 200;
@@ -1402,7 +1408,6 @@ public final class ActivityManagerService extends ActivityManagerNative
     final ServiceThread mHandlerThread;
     final MainHandler mHandler;
     final UiHandler mUiHandler;
-    final CpuTrackerHandler mCpuTrackerHandler;
 
     final class UiHandler extends Handler {
         public UiHandler() {
@@ -2053,50 +2058,72 @@ public final class ActivityManagerService extends ActivityManagerNative
                 // it is finished we make sure it is reset to its default.
                 mUserIsMonkey = false;
             } break;
+            case POST_PRIVACY_NOTIFICATION_MSG: {
+                INotificationManager inm = NotificationManager.getService();
+                if (inm == null) {
+                    return;
+                }
+
+                ActivityRecord root = (ActivityRecord)msg.obj;
+                ProcessRecord process = root.app;
+                if (process == null) {
+                    return;
+                }
+
+                try {
+                    Context context = mContext.createPackageContext(process.info.packageName, 0);
+                    String text = mContext.getString(R.string.privacy_guard_notification_detail,
+                            context.getApplicationInfo().loadLabel(context.getPackageManager()));
+                    String title = mContext.getString(R.string.privacy_guard_notification);
+
+                    Intent infoIntent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", root.packageName, null));
+
+                    Notification notification = new Notification();
+                    notification.icon = com.android.internal.R.drawable.stat_notify_privacy_guard;
+                    notification.when = 0;
+                    notification.flags = Notification.FLAG_ONGOING_EVENT;
+                    notification.priority = Notification.PRIORITY_LOW;
+                    notification.defaults = 0;
+                    notification.sound = null;
+                    notification.vibrate = null;
+                    notification.setLatestEventInfo(mContext,
+                            title, text,
+                            PendingIntent.getActivityAsUser(mContext, 0, infoIntent,
+                                    PendingIntent.FLAG_CANCEL_CURRENT, null,
+                                    new UserHandle(root.userId)));
+
+                    try {
+                        int[] outId = new int[1];
+                        inm.enqueueNotificationWithTag("android", "android", null,
+                                R.string.privacy_guard_notification,
+                                notification, outId, root.userId);
+                    } catch (RuntimeException e) {
+                        Slog.w(ActivityManagerService.TAG,
+                                "Error showing notification for privacy guard", e);
+                    } catch (RemoteException e) {
+                    }
+                } catch (NameNotFoundException e) {
+                    Slog.w(TAG, "Unable to create context for privacy guard notification", e);
+                }
+            } break;
+            case CANCEL_PRIVACY_NOTIFICATION_MSG: {
+                INotificationManager inm = NotificationManager.getService();
+                if (inm == null) {
+                    return;
+                }
+                try {
+                    inm.cancelNotificationWithTag("android", null,
+                            R.string.privacy_guard_notification,  msg.arg1);
+                } catch (RuntimeException e) {
+                    Slog.w(ActivityManagerService.TAG,
+                            "Error canceling notification for service", e);
+                } catch (RemoteException e) {
+                }
+            } break;
             }
         }
     };
-
-    static final int SCHEDULE_CPU_STATS_MSG = 1;
-    static final int UPDATE_CPU_STATS_MSG = 2;
-
-    final class CpuTrackerHandler extends Handler {
-        public CpuTrackerHandler(Looper looper) {
-            super(looper);
-        }
-
-        @Override
-        public void handleMessage(Message msg) {
-            switch (msg.what) {
-            case SCHEDULE_CPU_STATS_MSG: {
-                final long now = SystemClock.uptimeMillis();
-                long nextCpuDelay = (mLastCpuTime.get() + MONITOR_CPU_MAX_TIME) - now;
-                long nextWriteDelay = (mLastWriteTime + BATTERY_STATS_TIME) - now;
-                //Slog.i(TAG, "Cpu delay=" + nextCpuDelay + ", write delay=" + nextWriteDelay);
-                if (nextWriteDelay < nextCpuDelay) {
-                    nextCpuDelay = nextWriteDelay;
-                }
-                if (nextCpuDelay > 0) {
-                    mProcessCpuMutexFree.set(true);
-                    sendEmptyMessageDelayed(UPDATE_CPU_STATS_MSG, nextCpuDelay);
-                }
-            } break;
-            case UPDATE_CPU_STATS_MSG: {
-                updateCpuStatsNow();
-                schedule();
-            } break;
-            }
-        }
-
-        void schedule() {
-            sendEmptyMessage(SCHEDULE_CPU_STATS_MSG);
-        }
-
-        void updateNow() {
-            removeMessages(UPDATE_CPU_STATS_MSG);
-            sendEmptyMessage(UPDATE_CPU_STATS_MSG);
-        }
-    }
 
     static final int COLLECT_PSS_BG_MSG = 1;
 
@@ -2361,9 +2388,6 @@ public final class ActivityManagerService extends ActivityManagerNative
         mHandlerThread.start();
         mHandler = new MainHandler(mHandlerThread.getLooper());
         mUiHandler = new UiHandler();
-        HandlerThread cpuTrackerThread = new HandlerThread("CpuTracker");
-        cpuTrackerThread.start();
-        mCpuTrackerHandler = new CpuTrackerHandler(cpuTrackerThread.getLooper());
 
         mFgBroadcastQueue = new BroadcastQueue(this, mHandler,
                 "foreground", BROADCAST_FG_TIMEOUT, false);
@@ -2379,7 +2403,7 @@ public final class ActivityManagerService extends ActivityManagerNative
         File dataDir = Environment.getDataDirectory();
         File systemDir = new File(dataDir, "system");
         systemDir.mkdirs();
-        mBatteryStatsService = new BatteryStatsService(systemDir, mCpuTrackerHandler);
+        mBatteryStatsService = new BatteryStatsService(systemDir, mHandler);
         mBatteryStatsService.getActiveStatistics().readLocked();
         mBatteryStatsService.scheduleWriteToDisk();
         mOnBattery = DEBUG_POWER ? true
@@ -2414,6 +2438,36 @@ public final class ActivityManagerService extends ActivityManagerNative
         mStackSupervisor = new ActivityStackSupervisor(this, mRecentTasks);
         mTaskPersister = new TaskPersister(systemDir, mStackSupervisor, mRecentTasks);
 
+        mProcessCpuThread = new Thread("CpuTracker") {
+            @Override
+            public void run() {
+                while (true) {
+                    try {
+                        try {
+                            synchronized(this) {
+                                final long now = SystemClock.uptimeMillis();
+                                long nextCpuDelay = (mLastCpuTime.get()+MONITOR_CPU_MAX_TIME)-now;
+                                long nextWriteDelay = (mLastWriteTime+BATTERY_STATS_TIME)-now;
+                                //Slog.i(TAG, "Cpu delay=" + nextCpuDelay
+                                //        + ", write delay=" + nextWriteDelay);
+                                if (nextWriteDelay < nextCpuDelay) {
+                                    nextCpuDelay = nextWriteDelay;
+                                }
+                                if (nextCpuDelay > 0) {
+                                    mProcessCpuMutexFree.set(true);
+                                    this.wait(nextCpuDelay);
+                                }
+                            }
+                        } catch (InterruptedException e) {
+                        }
+                        updateCpuStatsNow();
+                    } catch (Exception e) {
+                        Slog.e(TAG, "Unexpected exception collecting process stats", e);
+                    }
+                }
+            }
+        };
+
         Watchdog.getInstance().addMonitor(this);
         Watchdog.getInstance().addThread(mHandler);
     }
@@ -2428,7 +2482,7 @@ public final class ActivityManagerService extends ActivityManagerNative
 
     private void start() {
         Process.removeAllProcessGroups();
-        mCpuTrackerHandler.schedule();
+        mProcessCpuThread.start();
 
         mBatteryStatsService.publish(mContext);
         mAppOpsService.publish(mContext);
@@ -2493,7 +2547,9 @@ public final class ActivityManagerService extends ActivityManagerNative
             return;
         }
         if (mProcessCpuMutexFree.compareAndSet(true, false)) {
-            mCpuTrackerHandler.updateNow();
+            synchronized (mProcessCpuThread) {
+                mProcessCpuThread.notify();
+            }
         }
     }
 
@@ -3399,17 +3455,6 @@ public final class ActivityManagerService extends ActivityManagerNative
             checkTime(startTime, "startProcess: building log message");
             StringBuilder buf = mStringBuilder;
             buf.setLength(0);
-            if(hostingType.equals("activity"))
-            {
-                BoostFramework mPerf = null;
-                if (null == mPerf) {
-                    mPerf = new BoostFramework();
-                }
-                if (mPerf != null) {
-                    mPerf.perfIOPrefetchStart(startResult.pid,app.processName);
-                }
-            }
-
             buf.append("Start proc ");
             buf.append(startResult.pid);
             buf.append(':');
@@ -6482,7 +6527,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                                 },
                                 0, null, null,
                                 new String[] {android.Manifest.permission.RECEIVE_BOOT_COMPLETED},
-                                AppOpsManager.OP_NONE, null, true, false,
+                                AppOpsManager.OP_BOOT_COMPLETED, null, true, false,
                                 MY_PID, Process.SYSTEM_UID, userId);
                     }
                 }
@@ -20372,7 +20417,7 @@ public final class ActivityManagerService extends ActivityManagerNative
                 broadcastIntentLocked(null, null, intent,
                         null, null, 0, null, null,
                         new String[] {android.Manifest.permission.RECEIVE_BOOT_COMPLETED},
-                        AppOpsManager.OP_NONE, null, true, false, MY_PID, Process.SYSTEM_UID,
+                        AppOpsManager.OP_BOOT_COMPLETED, null, true, false, MY_PID, Process.SYSTEM_UID,
                         userId);
             }
         }
